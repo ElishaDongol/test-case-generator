@@ -24,7 +24,7 @@ export interface Project {
 
 export const FORMAT_OPTIONS: { value: Format; label: string; icon: string; description: string }[] = [
   { value: "plain", label: "Plain Text", icon: "📝", description: "Numbered list" },
-  { value: "json", label: "JSON", icon: "{ }", description: "Structured data" },
+  { value: "json", label: "JSON", icon: "🗂️", description: "Structured data" },
   { value: "gherkin", label: "Gherkin / BDD", icon: "🥒", description: "Given/When/Then" },
   { value: "markdown", label: "Markdown Table", icon: "📊", description: "Table format" },
   { value: "excel", label: "Excel (.xlsx)", icon: "📗", description: "Download file" },

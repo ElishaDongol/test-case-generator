@@ -13,6 +13,41 @@ function stripMarkdown(text: string): string {
   return text.replace(/\*\*/g, "");
 }
 
+/** Remove leading/trailing markdown code fences that Gemini sometimes adds */
+function stripCodeFences(text: string): string {
+  return text
+    .replace(/^```[\w]*\s*\n?/i, "")
+    .replace(/\n?```\s*$/i, "")
+    .trim();
+}
+
+/** Return a user-safe error message — don't expose API URLs or model details */
+function sanitizeError(msg: string): string {
+  if (
+    /googleapis|generativelanguage|gemini|anthropic|api[\s_-]?key|https?:\/\//i.test(msg)
+  ) {
+    return "The AI service returned an error. Please make sure your image is a valid screenshot and try again.";
+  }
+  return msg;
+}
+
+/** Check file magic bytes to confirm it's really an image, not a renamed text file */
+async function validateImageBytes(file: File): Promise<boolean> {
+  try {
+    const buf = await file.slice(0, 12).arrayBuffer();
+    const b = new Uint8Array(buf);
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return true; // PNG
+    if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true; // JPEG
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return true; // GIF
+    if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+        b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return true; // WebP
+    if (b[0] === 0x42 && b[1] === 0x4d) return true; // BMP
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 /**
  * Detect test case heading lines. Only matches real TC titles, NOT numbered steps.
  * Matches:
@@ -93,12 +128,22 @@ function parseMarkdownTable(text: string): { headers: string[]; rows: string[][]
   if (lines.length < 2) return null;
 
   const parseRow = (line: string) =>
-    line.split("|").slice(1, -1).map((cell) => cell.trim());
+    line.split("|").slice(1, -1).map((cell) =>
+      cell.trim().replace(/<br\s*\/?>/gi, "\n")  // render <br> as actual newlines
+    );
 
-  const headers = parseRow(lines[0]);
+  // Strip trailing empty header columns (Gemini sometimes adds a trailing |)
+  let headers = parseRow(lines[0]);
+  while (headers.length > 0 && headers[headers.length - 1] === "") headers.pop();
+
   // Skip separator row (|---|---|...)
   const startIdx = lines[1].match(/^[|\s\-:]+$/) ? 2 : 1;
-  const rows = lines.slice(startIdx).map(parseRow);
+  // Normalize each row to exactly headers.length cells
+  const rows = lines.slice(startIdx).map((line) => {
+    const cells = parseRow(line);
+    while (cells.length < headers.length) cells.push("");
+    return cells.slice(0, headers.length);
+  });
 
   if (headers.length === 0) return null;
   return { headers, rows };
@@ -126,7 +171,7 @@ function createThumbnail(dataUrl: string, maxSize = 80): Promise<string> {
 export default function Home() {
   const pm = useProjects();
   const [sidebarOpen, setSidebarOpen] = useState(() =>
-    typeof window !== "undefined" ? window.innerWidth >= 1024 : true
+    typeof window !== "undefined" ? window.innerWidth >= 1024 : false
   );
 
   // Per-session generate state (not persisted)
@@ -166,7 +211,12 @@ export default function Home() {
         .then((saved) => setImages(saved))
         .catch(() => setImages([]));
     } else {
+      // No screen selected — clear everything so previous screen's context doesn't bleed into next generation
       setImages([]);
+      setContext("");
+      setResult(null);
+      setWordCount(0);
+      setError(null);
     }
   }, [pm.activeScreenId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -188,33 +238,50 @@ export default function Home() {
     imagesLoadedRef.current = false;
   }, [pm.activeScreenId]);
 
-  const handleFiles = (files: FileList | File[]) => {
-    const validFiles = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    if (validFiles.length === 0) {
+  const handleFiles = async (files: FileList | File[]) => {
+    const candidates = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    if (candidates.length === 0) {
       setError("Please upload image files (PNG, JPG, WEBP, GIF)");
       return;
     }
-    setError(null);
+
+    // Validate magic bytes so renamed text files are rejected
+    const checked = await Promise.all(
+      candidates.map(async (file) => ({ file, valid: await validateImageBytes(file) }))
+    );
+    const validFiles = checked.filter((c) => c.valid).map((c) => c.file);
+    const invalidNames = checked.filter((c) => !c.valid).map((c) => `"${c.file.name}"`);
+
+    if (invalidNames.length > 0) {
+      setError(`${invalidNames.join(", ")} ${invalidNames.length === 1 ? "is" : "are"} not a valid image file — please upload a real PNG, JPG, WEBP, or GIF.`);
+      if (validFiles.length === 0) return;
+    } else {
+      setError(null);
+    }
+
     setResult(null);
     setWordCount(0);
 
-    validFiles.forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const dataUrl = e.target?.result as string;
-        setImages((prev) => [
-          ...prev,
-          { base64: dataUrl.split(",")[1], mediaType: file.type, preview: dataUrl },
-        ]);
-      };
-      reader.readAsDataURL(file);
-    });
+    // Read all valid files then update state once (keeps order stable)
+    const newImages = await Promise.all(
+      validFiles.map((file) =>
+        new Promise<{ base64: string; mediaType: string; preview: string }>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const dataUrl = e.target?.result as string;
+            resolve({ base64: dataUrl.split(",")[1], mediaType: file.type, preview: dataUrl });
+          };
+          reader.readAsDataURL(file);
+        })
+      )
+    );
+    setImages((prev) => [...prev, ...newImages]);
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
-    if (e.dataTransfer.files.length > 0) handleFiles(e.dataTransfer.files);
+    if (e.dataTransfer.files.length > 0) handleFiles(e.dataTransfer.files).catch(() => {});
   };
 
   const removeImage = (index: number, e: React.MouseEvent) => {
@@ -316,13 +383,21 @@ export default function Home() {
         }
       }
 
+      // Strip code fences that Gemini adds to JSON output
+      if (format === "json") {
+        accumulated = stripCodeFences(accumulated);
+        setResult(accumulated);
+        setWordCount(accumulated.trim().split(/\s+/).filter(Boolean).length);
+      }
+
       // Save to screen if one is selected
       if (pm.activeProjectId && pm.activeScreenId && accumulated) {
         const thumb = images.length > 0 ? await createThumbnail(images[0].preview) : null;
         pm.saveScreenResult(pm.activeProjectId, pm.activeScreenId, accumulated, format, context, thumb);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to generate test cases");
+      const raw = err instanceof Error ? err.message : "Failed to generate test cases";
+      setError(sanitizeError(raw));
     } finally {
       setLoading(false);
     }
@@ -330,7 +405,8 @@ export default function Home() {
 
   const handleCopy = () => {
     if (!result || result === "__excel_downloaded__") return;
-    navigator.clipboard.writeText(stripMarkdown(result));
+    const text = format === "json" ? stripCodeFences(result) : stripMarkdown(result);
+    navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -344,12 +420,19 @@ export default function Home() {
   const handleDownloadText = () => {
     if (!result || result === "__excel_downloaded__") return;
     const ext = format === "json" ? "json" : format === "markdown" ? "md" : "txt";
-    const cleanResult = format === "plain" ? stripMarkdown(result) : result;
+    let cleanResult = format === "plain" ? stripMarkdown(result) : result;
+    if (format === "json") cleanResult = stripCodeFences(cleanResult);
     const blob = new Blob([cleanResult], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `test-cases.${ext}`;
+    // Name the file after project + screen if available
+    const slug = [pm.activeProject?.name, pm.activeScreen?.name]
+      .filter(Boolean)
+      .join("-")
+      .replace(/[^a-zA-Z0-9-_ ]/g, "")
+      .trim() || "test-cases";
+    a.download = `${slug}.${ext}`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -407,7 +490,7 @@ export default function Home() {
   const screenLabel = pm.activeScreen?.name ?? null;
 
   return (
-    <div className="min-h-screen flex flex-col" style={{ background: "linear-gradient(135deg, #f0f4ff 0%, #faf5ff 50%, #f0fdf4 100%)" }}>
+    <div className="h-screen flex flex-col overflow-hidden" style={{ background: "linear-gradient(135deg, #f0f4ff 0%, #faf5ff 50%, #f0fdf4 100%)" }}>
 
       {/* Header */}
       <header className="border-b border-white/60 backdrop-blur-sm sticky top-0 z-20" style={{ background: "rgba(255,255,255,0.85)" }}>
@@ -604,7 +687,7 @@ export default function Home() {
                         <div className={`grid gap-2 ${images.length === 1 ? "grid-cols-1" : images.length === 2 ? "grid-cols-2" : "grid-cols-3"}`}>
                           {images.map((img, i) => (
                             <div key={i} className="relative group rounded-xl overflow-hidden border border-gray-200 bg-gray-50">
-                              <img src={img.preview} alt={`Screenshot ${i + 1}`} className="w-full object-cover h-32" />
+                              <img src={img.preview} alt={`Screenshot ${i + 1}`} className="w-full object-contain h-32 bg-gray-50" />
                               <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-all flex items-center justify-center">
                                 <button
                                   onClick={(e) => removeImage(i, e)}
@@ -624,7 +707,7 @@ export default function Home() {
                     )}
                   </div>
                   <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden"
-                    onChange={(e) => { if (e.target.files && e.target.files.length > 0) { handleFiles(e.target.files); e.target.value = ""; } }} />
+                    onChange={(e) => { if (e.target.files && e.target.files.length > 0) { handleFiles(e.target.files).catch(() => {}); e.target.value = ""; } }} />
                 </div>
               )}
 
@@ -670,16 +753,29 @@ export default function Home() {
                 </div>
                 <textarea
                   value={context}
-                  onChange={(e) => setContext(e.target.value)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setContext(val);
+                    // Persist immediately so it survives screen switches
+                    if (pm.activeProjectId && pm.activeScreenId) {
+                      pm.updateScreenContext(pm.activeProjectId, pm.activeScreenId, val);
+                    }
+                  }}
                   placeholder="Describe what this screen is for, the user type, or any specific testing requirements..."
                   rows={3}
                   className="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-transparent transition-all placeholder:text-gray-400 resize-none"
                 />
                 <div className="mt-2">
-                  <p className="text-xs text-gray-400 mb-1.5">Quick fill:</p>
+                  <p className="text-xs text-gray-400 mb-1.5">Quick fill <span className="text-gray-300">(appends to existing text):</span></p>
                   <div className="flex flex-wrap gap-1.5">
                     {CONTEXT_SUGGESTIONS.map((s) => (
-                      <button key={s} onClick={() => setContext(s)}
+                      <button key={s} onClick={() => {
+                        const val = context.trim() ? context.trim() + " — " + s : s;
+                        setContext(val);
+                        if (pm.activeProjectId && pm.activeScreenId) {
+                          pm.updateScreenContext(pm.activeProjectId, pm.activeScreenId, val);
+                        }
+                      }}
                         className="text-xs px-2.5 py-1 rounded-full border border-gray-200 text-gray-500 hover:border-violet-300 hover:text-violet-600 hover:bg-violet-50 transition-all">
                         {s}
                       </button>
@@ -742,8 +838,8 @@ export default function Home() {
             </div>
 
             {/* ── Right column — Output ── */}
-            <div className="lg:col-span-3">
-              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden flex flex-col min-h-[400px] sm:min-h-[560px] lg:min-h-[680px]">
+            <div className="lg:col-span-3 lg:sticky lg:top-4 lg:self-start">
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden flex flex-col" style={{ minHeight: "400px", maxHeight: "min(82vh, 860px)" }}>
 
                 {/* Output toolbar */}
                 <div className="flex items-center justify-between gap-2 px-3 sm:px-5 py-3 sm:py-3.5 border-b border-gray-100 bg-gray-50/50 flex-shrink-0 flex-wrap">
@@ -977,7 +1073,7 @@ export default function Home() {
                               return (
                                 <tr key={ri} className="border-b border-gray-100 hover:bg-violet-50/20 transition-colors group">
                                   {row.map((cell, ci) => (
-                                    <td key={ci} className="px-3 py-2.5 text-gray-700 align-top">
+                                    <td key={ci} className="px-3 py-2.5 text-gray-700 align-top whitespace-pre-line">
                                       {cell}
                                     </td>
                                   ))}

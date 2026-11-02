@@ -134,6 +134,20 @@ export function useProjects() {
     [activeScreenId]
   );
 
+  /** Persist the user's context text for a screen (called on every keystroke) */
+  const updateScreenContext = useCallback(
+    (projectId: string, screenId: string, context: string) => {
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === projectId
+            ? { ...p, screens: p.screens.map((s) => s.id === screenId ? { ...s, context } : s) }
+            : p
+        )
+      );
+    },
+    []
+  );
+
   /** Save generated test cases + metadata to a screen */
   const saveScreenResult = useCallback(
     (projectId: string, screenId: string, result: string, format: Format, context: string, thumbnail: string | null) => {
@@ -170,6 +184,7 @@ export function useProjects() {
     addScreen,
     renameScreen,
     deleteScreen,
+    updateScreenContext,
     saveScreenResult,
   };
 }

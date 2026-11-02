@@ -4,6 +4,14 @@ import { analyzeDesign, analyzeDesignStream } from "@/lib/gemini";
 import type { ImageInput } from "@/lib/gemini";
 import { exportToExcel } from "@/lib/exporters";
 
+/** Strip leading/trailing markdown code fences that Gemini sometimes adds */
+function stripCodeFences(text: string): string {
+  return text
+    .replace(/^```[\w]*\s*\n?/i, "")
+    .replace(/\n?```\s*$/i, "")
+    .trim();
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -37,7 +45,7 @@ export async function POST(req: NextRequest) {
     if (format === "excel") {
       const result = await analyzeDesign(imageInputs, format, context);
       try {
-        const buffer = exportToExcel(result);
+        const buffer = exportToExcel(stripCodeFences(result));
         return new NextResponse(buffer as unknown as BodyInit, {
           headers: {
             "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
